@@ -151,12 +151,15 @@ func (c *Client) call(ctx context.Context, method string, params any, result any
 	}
 	line = append(line, '\n')
 	written := make(chan error, 1)
+	var writeMu sync.Mutex
 	go func() {
 		defer func() { <-c.writeGate }()
 		n, err := c.writer.Write(line)
 		if err == nil && n != len(line) {
 			err = io.ErrShortWrite
 		}
+		writeMu.Lock()
+		defer writeMu.Unlock()
 		if err != nil {
 			// A failed write may have broken framing. Poison the connection
 			// before another caller can acquire the write gate.
@@ -170,9 +173,20 @@ func (c *Client) call(ctx context.Context, method string, params any, result any
 			err = c.Err()
 		}
 	case <-ctx.Done():
-		// An interrupted write may have emitted only part of a JSON line.
-		c.stop(fmt.Errorf("imessage: write canceled: %w", ctx.Err()))
-		err = ctx.Err()
+		// Serialize with publication so cancellation only closes a write
+		// that has not completed. Never hold writeMu during Write itself.
+		writeMu.Lock()
+		select {
+		case err = <-written:
+			if err != nil {
+				err = c.Err()
+			}
+		default:
+			// An interrupted write may have emitted only part of a JSON line.
+			c.stop(fmt.Errorf("imessage: write canceled: %w", ctx.Err()))
+			err = ctx.Err()
+		}
+		writeMu.Unlock()
 	case <-c.done:
 		err = c.Err()
 	}
@@ -268,25 +282,46 @@ func (c *Client) handleRecord(line []byte) error {
 }
 
 func (c *Client) notify(method string, params json.RawMessage) error {
-	var fields struct {
-		Subscription     int64    `json:"subscription"`
-		Message          *Message `json:"message"`
-		ResumeAfterRowID *int64   `json:"resume_after_rowid"`
-		Reason           string   `json:"reason"`
-		Terminal         bool     `json:"terminal"`
-	}
-	if len(params) != 0 {
-		if err := json.Unmarshal(params, &fields); err != nil {
-			return fmt.Errorf("%w: notification params: %v", ErrProtocol, err)
+	n := Notification{Method: method, Params: params}
+	switch method {
+	case "message":
+		var fields struct {
+			Subscription int64    `json:"subscription"`
+			Message      *Message `json:"message"`
 		}
-	}
-	if method == "message" && fields.Message == nil {
-		return fmt.Errorf("%w: missing notification message", ErrProtocol)
-	}
-	n := Notification{
-		Method: method, Params: params, Subscription: fields.Subscription,
-		Message: fields.Message, ResumeAfterRowID: fields.ResumeAfterRowID,
-		Reason: fields.Reason, Terminal: fields.Terminal,
+		if len(params) != 0 {
+			if err := json.Unmarshal(params, &fields); err != nil {
+				return fmt.Errorf("%w: notification params: %v", ErrProtocol, err)
+			}
+		}
+		if fields.Message == nil {
+			return fmt.Errorf("%w: missing notification message", ErrProtocol)
+		}
+		n.Subscription, n.Message = fields.Subscription, fields.Message
+	case "watch.overflow":
+		var fields struct {
+			Subscription     int64  `json:"subscription"`
+			ResumeAfterRowID *int64 `json:"resume_after_rowid"`
+			Reason           string `json:"reason"`
+			Terminal         bool   `json:"terminal"`
+		}
+		if len(params) != 0 {
+			if err := json.Unmarshal(params, &fields); err != nil {
+				return fmt.Errorf("%w: notification params: %v", ErrProtocol, err)
+			}
+		}
+		n.Subscription, n.ResumeAfterRowID = fields.Subscription, fields.ResumeAfterRowID
+		n.Reason, n.Terminal = fields.Reason, fields.Terminal
+	case "error":
+		var fields struct {
+			Subscription int64 `json:"subscription"`
+		}
+		if len(params) != 0 {
+			if err := json.Unmarshal(params, &fields); err != nil {
+				return fmt.Errorf("%w: notification params: %v", ErrProtocol, err)
+			}
+		}
+		n.Subscription = fields.Subscription
 	}
 	select {
 	case <-c.done:

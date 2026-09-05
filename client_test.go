@@ -131,8 +131,8 @@ func TestMethodsAndNotifications(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, line := range []string{
-		`{"jsonrpc":"2.0","method":"message","params":{"subscription":7,"message":{"id":81,"chat_id":42,"text":"new","is_group":true,"created_at":"2026-09-05T12:00:00Z"}}}`,
-		`{"jsonrpc":"2.0","method":"watch.overflow","params":{"subscription":7,"resume_after_rowid":80,"reason":"buffer_limit_exceeded","terminal":true}}`,
+		`{"jsonrpc":"2.0","method":"message","params":{"subscription":7,"message":{"id":81,"chat_id":42,"text":"new","is_group":true,"created_at":"2026-09-05T12:00:00Z"},"reason":{"extension":true}}}`,
+		`{"jsonrpc":"2.0","method":"watch.overflow","params":{"subscription":7,"resume_after_rowid":80,"reason":"buffer_limit_exceeded","terminal":true,"message":"watch status"}}`,
 		`{"jsonrpc":"2.0","method":"error","params":{"subscription":7,"error":{"message":"watch failed","code":-32603}}}`,
 	} {
 		if _, err := fmt.Fprintln(server.writer, line); err != nil {
@@ -166,6 +166,46 @@ func TestMethodsAndNotifications(t *testing.T) {
 	server.reply(t, request.ID, json.RawMessage(`{"ok":true,"id":82,"guid":"sent-guid","transport":"bridge"}`))
 	if err := await(t, finished); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestUnknownNotificationsPreserveParams(t *testing.T) {
+	for _, params := range []string{
+		`[1, "extension", {"message":"status"}]`,
+		`{"message":"watch status","subscription":"extension-owned","terminal":[]}`,
+		`{"message":{"id":81},"future_field":true}`,
+		`"extension status"`,
+		`null`,
+		``,
+	} {
+		t.Run(params, func(t *testing.T) {
+			client, server := newTestClient(t)
+			line := `{"jsonrpc":"2.0","method":"extension.status"`
+			if params != "" {
+				line += `,"params":` + params
+			}
+			if _, err := fmt.Fprintln(server.writer, line+`}`); err != nil {
+				t.Fatal(err)
+			}
+			n := await(t, client.Notifications())
+			if n.Method != "extension.status" || string(n.Params) != params {
+				t.Fatalf("lost extension notification: %+v", n)
+			}
+			if n.Subscription != 0 || n.Message != nil || n.ResumeAfterRowID != nil || n.Reason != "" || n.Terminal {
+				t.Fatalf("interpreted extension params as known fields: %+v", n)
+			}
+			if err := client.Err(); err != nil {
+				t.Fatalf("extension closed client: %v", err)
+			}
+			finished := make(chan error, 1)
+			ctx := testContext(t)
+			go func() { _, err := client.Chats(ctx, 1); finished <- err }()
+			request := server.request(t, "chats.list")
+			server.reply(t, request.ID, json.RawMessage(`{"chats":[]}`))
+			if err := await(t, finished); err != nil {
+				t.Fatalf("RPC after extension failed: %v", err)
+			}
+		})
 	}
 }
 
@@ -290,16 +330,64 @@ func TestCloseWakesPendingAndBlockedWriters(t *testing.T) {
 
 func TestBlockedWriteCancellation(t *testing.T) {
 	client, _ := newTestClient(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	ctx, resume := newPausedContext(t, 2)
+	cancelCtx, cancel := context.WithCancel(ctx.Context)
+	ctx.Context = cancelCtx
 	defer cancel()
-	_, err := client.Send(ctx, 42, "hi")
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("expected deadline: %v", err)
+	finished := make(chan error, 1)
+	go func() { _, err := client.Send(ctx, 42, "hi"); finished <- err }()
+	await(t, ctx.paused) // The server never reads, so the write cannot complete.
+	cancel()
+	resume()
+	if err := await(t, finished); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected cancellation: %v", err)
 	}
-	if !errors.Is(client.Err(), context.DeadlineExceeded) {
+	if !errors.Is(client.Err(), context.Canceled) {
 		t.Fatalf("blocked partial write did not close client: %v", client.Err())
 	}
 	await(t, client.readDone)
+	select {
+	case client.writeGate <- struct{}{}:
+		<-client.writeGate
+	case <-testContext(t).Done():
+		t.Fatal("cancellation did not unblock writer")
+	}
+}
+
+func TestKnownNotificationsDecodeOnlyTheirFields(t *testing.T) {
+	for _, tt := range []struct {
+		method string
+		params string
+	}{
+		{"message", `{"subscription":7,"message":{"id":81},"reason":[],"terminal":"ignored"}`},
+		{"watch.overflow", `{"subscription":7,"resume_after_rowid":80,"reason":"overflow","terminal":true,"message":"ignored"}`},
+		{"error", `{"subscription":7,"message":"watch failed","error":{"code":-1},"terminal":"ignored"}`},
+	} {
+		t.Run(tt.method, func(t *testing.T) {
+			client, server := newTestClient(t)
+			if _, err := fmt.Fprintf(server.writer, "{\"jsonrpc\":\"2.0\",\"method\":%q,\"params\":%s}\n", tt.method, tt.params); err != nil {
+				t.Fatal(err)
+			}
+			n := await(t, client.Notifications())
+			if n.Method != tt.method || string(n.Params) != tt.params || n.Subscription != 7 {
+				t.Fatalf("lost known notification fields: %+v", n)
+			}
+			switch tt.method {
+			case "message":
+				if n.Message == nil || n.Message.ID != 81 || n.Reason != "" || n.Terminal {
+					t.Fatalf("unexpected message fields: %+v", n)
+				}
+			case "watch.overflow":
+				if n.ResumeAfterRowID == nil || *n.ResumeAfterRowID != 80 || n.Reason != "overflow" || !n.Terminal || n.Message != nil {
+					t.Fatalf("unexpected overflow fields: %+v", n)
+				}
+			case "error":
+				if n.Message != nil || n.Terminal {
+					t.Fatalf("unexpected error fields: %+v", n)
+				}
+			}
+		})
+	}
 }
 
 func TestNotificationOverflowTerminatesExplicitly(t *testing.T) {
@@ -335,6 +423,10 @@ func TestReaderFailures(t *testing.T) {
 		{"malformed", "not JSON\n", ErrProtocol},
 		{"version", "{\"jsonrpc\":\"1.0\"}\n", ErrProtocol},
 		{"missing message", "{\"jsonrpc\":\"2.0\",\"method\":\"message\",\"params\":{}}\n", ErrProtocol},
+		{"message array", "{\"jsonrpc\":\"2.0\",\"method\":\"message\",\"params\":[]}\n", ErrProtocol},
+		{"message string", "{\"jsonrpc\":\"2.0\",\"method\":\"message\",\"params\":{\"message\":\"invalid\"}}\n", ErrProtocol},
+		{"overflow array", "{\"jsonrpc\":\"2.0\",\"method\":\"watch.overflow\",\"params\":[]}\n", ErrProtocol},
+		{"overflow cursor", "{\"jsonrpc\":\"2.0\",\"method\":\"watch.overflow\",\"params\":{\"resume_after_rowid\":\"invalid\"}}\n", ErrProtocol},
 		{"invalid response", "{\"jsonrpc\":\"2.0\",\"id\":\"1\"}\n", ErrProtocol},
 		{"both result and error", "{\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":{},\"error\":{\"code\":-1,\"message\":\"bad\"}}\n", ErrProtocol},
 		{"oversize", strings.Repeat("x", MaxRecordBytes+1), ErrRecordTooLarge},
@@ -457,6 +549,92 @@ func TestWriteFailurePoisonsBeforeReleasingGate(t *testing.T) {
 			}
 			if len(writes) != 1 {
 				t.Fatalf("wrote %d requests on failed connection", len(writes))
+			}
+		})
+	}
+}
+
+func TestCompletedWriteCancellationKeepsClientHealthy(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		record string
+	}{
+		{"no response", ""},
+		{"ack", `"result":{"ok":true,"id":82}`},
+		{"RPC error", `"error":{"code":-32001,"message":"uncertain","data":{"retry_safe":false}}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// Both select arms are ready on resume; repeat to exercise either
+			// choice without relying on sleeps to arrange the race.
+			for range 20 {
+				client, server := newTestClient(t)
+				ctx, resume := newPausedContext(t, 2)
+				canceled, cancel := context.WithCancel(ctx.Context)
+				ctx.Context = canceled
+				t.Cleanup(cancel)
+				type outcome struct {
+					result SendResult
+					err    error
+				}
+				finished := make(chan outcome, 1)
+				go func() {
+					result, err := client.Send(ctx, 42, "hi")
+					finished <- outcome{result, err}
+				}()
+				request := server.request(t, "send")
+				await(t, ctx.paused)
+				// Acquiring the gate proves success is queued in written while
+				// the caller is still paused before its write-phase select.
+				select {
+				case client.writeGate <- struct{}{}:
+				case <-testContext(t).Done():
+					t.Fatal("writer did not release gate")
+				}
+				<-client.writeGate
+				if tt.record != "" {
+					if err := client.handleRecord([]byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":%q,%s}`, request.ID, tt.record))); err != nil {
+						t.Fatal(err)
+					}
+				}
+				cancel()
+				resume()
+				got := await(t, finished)
+				switch tt.name {
+				case "no response":
+					if !errors.Is(got.err, context.Canceled) {
+						t.Fatalf("expected cancellation: %v", got.err)
+					}
+				case "ack":
+					if got.err != nil || !got.result.OK || got.result.ID != 82 {
+						t.Fatalf("lost acknowledgement: %+v, %v", got.result, got.err)
+					}
+				case "RPC error":
+					var rpcErr *RPCError
+					if !errors.As(got.err, &rpcErr) || rpcErr.Code != -32001 || string(rpcErr.Data) != `{"retry_safe":false}` {
+						t.Fatalf("lost RPC error: %v", got.err)
+					}
+				}
+				if err := client.Err(); err != nil {
+					t.Fatalf("completed write cancellation closed client: %v", err)
+				}
+				client.mu.Lock()
+				pending := len(client.pending)
+				client.mu.Unlock()
+				if pending != 0 {
+					t.Fatalf("pending calls leaked: %d", pending)
+				}
+				next := make(chan error, 1)
+				nextCtx := testContext(t)
+				go func() { _, err := client.Chats(nextCtx, 1); next <- err }()
+				other := server.request(t, "chats.list")
+				if tt.record == "" {
+					server.reply(t, request.ID, json.RawMessage(`{"ok":true}`))
+				}
+				server.reply(t, other.ID, json.RawMessage(`{"chats":[]}`))
+				if err := await(t, next); err != nil {
+					t.Fatalf("subsequent RPC failed: %v", err)
+				}
+				client.Close()
 			}
 		})
 	}

@@ -86,7 +86,8 @@ func (e *RPCError) Error() string {
 
 // Notification preserves every upstream method and its unmodified parameters.
 // Message is populated for message notifications. Watch overflow notifications
-// expose the server's resumable cursor; generic errors remain available in Params.
+// expose the server's resumable cursor; generic errors expose their subscription.
+// Unknown methods remain uninterpreted in Params.
 type Notification struct {
 	Method           string
 	Params           json.RawMessage
