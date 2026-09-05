@@ -63,6 +63,19 @@ type Attachment struct {
 	ConvertedMIMEType string `json:"converted_mime_type"`
 }
 
+// Reaction is one of the six standard native tapbacks accepted by imsg's
+// bridge RPC. Custom emoji and aliases are deliberately not accepted.
+type Reaction string
+
+const (
+	ReactionLove      Reaction = "love"
+	ReactionLike      Reaction = "like"
+	ReactionDislike   Reaction = "dislike"
+	ReactionLaugh     Reaction = "laugh"
+	ReactionEmphasize Reaction = "emphasize"
+	ReactionQuestion  Reaction = "question"
+)
+
 // SendResult acknowledges acceptance, not necessarily delivery. ID and GUID
 // are best-effort and can be absent (zero/empty).
 type SendResult struct {
