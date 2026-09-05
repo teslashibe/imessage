@@ -157,35 +157,51 @@ func (c *Client) call(ctx context.Context, method string, params any, result any
 		if err == nil && n != len(line) {
 			err = io.ErrShortWrite
 		}
+		if err != nil {
+			// A failed write may have broken framing. Poison the connection
+			// before another caller can acquire the write gate.
+			c.stop(fmt.Errorf("imessage: write: %w", err))
+		}
 		written <- err
 	}()
 	select {
-	case err := <-written:
+	case err = <-written:
 		if err != nil {
-			c.stop(fmt.Errorf("imessage: write: %w", err))
-			return c.Err()
+			err = c.Err()
 		}
 	case <-ctx.Done():
 		// An interrupted write may have emitted only part of a JSON line.
 		c.stop(fmt.Errorf("imessage: write canceled: %w", ctx.Err()))
-		return ctx.Err()
+		err = ctx.Err()
 	case <-c.done:
-		return c.Err()
+		err = c.Err()
 	}
-	select {
-	case reply := <-replies:
-		if reply.err != nil {
-			return reply.err
+	var reply response
+	if err == nil {
+		select {
+		case reply = <-replies:
+		case <-ctx.Done():
+			err = ctx.Err()
+		case <-c.done:
+			err = c.Err()
 		}
-		if err := json.Unmarshal(reply.result, result); err != nil {
-			return fmt.Errorf("%w: %s result: %v", ErrProtocol, method, err)
-		}
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-c.done:
-		return c.Err()
 	}
+	if err != nil {
+		// A received response is authoritative even if shutdown became ready
+		// in either wait above (including before Write returned).
+		select {
+		case reply = <-replies:
+		default:
+			return err
+		}
+	}
+	if reply.err != nil {
+		return reply.err
+	}
+	if err := json.Unmarshal(reply.result, result); err != nil {
+		return fmt.Errorf("%w: %s result: %v", ErrProtocol, method, err)
+	}
+	return nil
 }
 
 func (c *Client) readLoop() {
@@ -241,10 +257,12 @@ func (c *Client) handleRecord(line []byte) error {
 	c.mu.Lock()
 	replies := c.pending[id]
 	delete(c.pending, id)
-	c.mu.Unlock()
 	if replies != nil {
+		// Publish under mu so stop cannot signal done before this response
+		// reaches its caller. The single-response channel is buffered.
 		replies <- response{result: record.Result, err: record.Error}
 	}
+	c.mu.Unlock()
 	// Late responses to canceled calls are expected and ignored.
 	return nil
 }

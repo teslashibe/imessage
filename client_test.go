@@ -116,7 +116,7 @@ func TestMethodsAndNotifications(t *testing.T) {
 	}
 
 	go func() {
-		id, err := client.Subscribe(ctx, -1)
+		id, err := client.SubscribeAll(ctx, -1)
 		if err == nil && id != 7 {
 			err = fmt.Errorf("unexpected subscription: %d", id)
 		}
@@ -375,6 +375,147 @@ func TestShortWriteTerminatesClient(t *testing.T) {
 	await(t, client.readDone)
 }
 
+type pausedContext struct {
+	context.Context
+	pauseAt int
+	calls   int
+	paused  chan struct{}
+	resume  chan struct{}
+}
+
+// Done pauses call at a specific select, making all competing events ready
+// before selection rather than relying on sleeps or scheduler timing.
+func (c *pausedContext) Done() <-chan struct{} {
+	c.calls++
+	if c.calls == c.pauseAt {
+		close(c.paused)
+		<-c.resume
+	}
+	return c.Context.Done()
+}
+
+func newPausedContext(t *testing.T, pauseAt int) (*pausedContext, func()) {
+	t.Helper()
+	ctx := &pausedContext{
+		Context: testContext(t), pauseAt: pauseAt,
+		paused: make(chan struct{}), resume: make(chan struct{}),
+	}
+	resume := sync.OnceFunc(func() { close(ctx.resume) })
+	t.Cleanup(resume)
+	return ctx, resume
+}
+
+type functionWriter func([]byte) (int, error)
+
+func (w functionWriter) Write(p []byte) (int, error) { return w(p) }
+func (functionWriter) Close() error                  { return nil }
+
+func TestWriteFailurePoisonsBeforeReleasingGate(t *testing.T) {
+	writeErr := errors.New("write failed")
+	for _, tt := range []struct {
+		name string
+		n    int
+		err  error
+		want error
+	}{
+		{"failed", 0, writeErr, writeErr},
+		{"partial error", 1, writeErr, writeErr},
+		{"short write", 1, nil, io.ErrShortWrite},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			reader, serverWriter := io.Pipe()
+			t.Cleanup(func() { serverWriter.Close() })
+			writes := make(chan struct{}, 2)
+			client := NewClient(reader, functionWriter(func([]byte) (int, error) {
+				writes <- struct{}{}
+				return tt.n, tt.err
+			}))
+			t.Cleanup(func() { client.Close() })
+			ctx, resume := newPausedContext(t, 2)
+			finished := make(chan error, 1)
+			go func() { _, err := client.Send(ctx, 42, "first"); finished <- err }()
+			await(t, ctx.paused)
+
+			// The caller cannot process the write result yet. Acquiring the
+			// gate proves the writer itself made the failure terminal first.
+			select {
+			case client.writeGate <- struct{}{}:
+			case <-testContext(t).Done():
+				t.Fatal("writer did not release gate")
+			}
+			err := client.Err()
+			<-client.writeGate
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("gate released before connection was poisoned: %v", err)
+			}
+			if _, err := client.Send(testContext(t), 42, "second"); !errors.Is(err, tt.want) {
+				t.Fatalf("later call did not retain write failure: %v", err)
+			}
+			resume()
+			if err := await(t, finished); !errors.Is(err, tt.want) {
+				t.Fatalf("first call did not retain write failure: %v", err)
+			}
+			if len(writes) != 1 {
+				t.Fatalf("wrote %d requests on failed connection", len(writes))
+			}
+		})
+	}
+}
+
+func TestReceivedResponseWinsOverEOF(t *testing.T) {
+	for _, phase := range []struct {
+		name    string
+		pauseAt int
+	}{
+		{"write completion", 2},
+		{"response wait", 3},
+	} {
+		for _, tt := range []struct {
+			name   string
+			record string
+		}{
+			{"ack", `"result":{"ok":true,"id":82,"guid":"sent-guid","transport":"bridge"}`},
+			{"RPC error", `"error":{"code":-32001,"message":"uncertain","data":{"retry_safe":false,"disposition":"still_in_flight","future_field":123}}`},
+		} {
+			t.Run(phase.name+"/"+tt.name, func(t *testing.T) {
+				client, server := newTestClient(t)
+				ctx, resume := newPausedContext(t, phase.pauseAt)
+				type outcome struct {
+					result SendResult
+					err    error
+				}
+				finished := make(chan outcome, 1)
+				go func() {
+					result, err := client.Send(ctx, 42, "hi")
+					finished <- outcome{result, err}
+				}()
+				request := server.request(t, "send")
+				await(t, ctx.paused)
+				if _, err := fmt.Fprintf(server.writer, "{\"jsonrpc\":\"2.0\",\"id\":%q,%s}\n", request.ID, tt.record); err != nil {
+					t.Fatal(err)
+				}
+				server.writer.Close()
+				await(t, client.readDone)
+				if !errors.Is(client.Err(), io.EOF) {
+					t.Fatalf("expected terminal EOF: %v", client.Err())
+				}
+				resume()
+				got := await(t, finished)
+				if tt.name == "ack" {
+					if got.err != nil || !got.result.OK || got.result.ID != 82 || got.result.GUID != "sent-guid" || got.result.Transport != "bridge" {
+						t.Fatalf("lost received acknowledgement: %+v, %v", got.result, got.err)
+					}
+				} else {
+					var rpcErr *RPCError
+					if !errors.As(got.err, &rpcErr) || rpcErr.Code != -32001 || rpcErr.Message != "uncertain" || string(rpcErr.Data) != `{"retry_safe":false,"disposition":"still_in_flight","future_field":123}` {
+						t.Fatalf("lost received RPC error: %v (%+v)", got.err, rpcErr)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestInvalidResults(t *testing.T) {
 	for _, result := range []string{`null`, `{}`, `{"chats":null}`, `{"chats":"invalid"}`} {
 		t.Run(result, func(t *testing.T) {
@@ -412,7 +553,7 @@ func TestValidationAndDefaultLimit(t *testing.T) {
 	if _, err := client.History(ctx, 0, 1); err == nil {
 		t.Fatal("zero chat accepted")
 	}
-	if _, err := client.Subscribe(ctx, -2); err == nil {
+	if _, err := client.SubscribeAll(ctx, -2); err == nil {
 		t.Fatal("invalid cursor accepted")
 	}
 	if _, err := client.Send(ctx, 1, ""); err == nil {
