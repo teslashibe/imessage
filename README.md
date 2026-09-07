@@ -7,7 +7,7 @@ A Go client for the newline-delimited JSON-RPC interface provided by [imsg](http
 ## Requirements and installation
 
 - Go 1.25.0 or newer, as declared in `go.mod`. Use a currently supported
-  patched release; CI tests Go 1.25.12 and Go 1.26.5.
+  patched release; CI tests Go 1.25.13 and Go 1.26.6.
 - For live Messages access, an operator-managed `imsg rpc` process on macOS with Messages configured and the permissions required by imsg. Follow [upstream documentation](https://github.com/openclaw/imsg) for installation and permissions.
 - The Go transport can run separately from the Mac when supplied appropriate streams. This package does not install imsg or configure remote connections.
 
@@ -21,7 +21,7 @@ go get github.com/teslashibe/imessage
 
 | Area | Support and limitations |
 | --- | --- |
-| Go | The module declares Go 1.25.0. Use a patched Go toolchain; CI tests 1.25.12 and 1.26.5. |
+| Go | The module declares Go 1.25.0. Use a patched Go toolchain; CI tests 1.25.13 and 1.26.6. |
 | imsg | RPC behavior is documented and tested against exactly imsg v0.15.1. Other versions may change methods, fields, or semantics. |
 | Reads, sends, and subscriptions | Supported through an operator-managed `imsg rpc` process. The caller owns process startup, authentication, transport security, and access policy. |
 | Native replies and tapbacks | In imsg v0.15.1 these require its private IMCore bridge. A normal signed imsg installation with SIP enabled does not provide them. There is no fallback in this package. |

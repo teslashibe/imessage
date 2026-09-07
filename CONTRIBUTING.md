@@ -21,7 +21,7 @@ go test ./...
 go test -race ./...
 ```
 
-Use a patched Go toolchain; CI currently uses Go 1.25.12 and 1.26.5. Tests must remain
+Use a patched Go toolchain; CI currently uses Go 1.25.13 and 1.26.6. Tests must remain
 self-contained and must not access a live Messages database or send messages.
 By contributing, you agree that your contribution is licensed under the MIT
 License in this repository.
