@@ -6,17 +6,27 @@ A Go client for the newline-delimited JSON-RPC interface provided by [imsg](http
 
 ## Requirements and installation
 
-- Go 1.25.0 or newer, as declared in `go.mod`.
+- Go 1.25.0 or newer, as declared in `go.mod`. Use a currently supported
+  patched release; CI tests Go 1.25.13 and Go 1.26.6.
 - For live Messages access, an operator-managed `imsg rpc` process on macOS with Messages configured and the permissions required by imsg. Follow [upstream documentation](https://github.com/openclaw/imsg) for installation and permissions.
 - The Go transport can run separately from the Mac when supplied appropriate streams. This package does not install imsg or configure remote connections.
 
-With repository access and Git authentication configured, run from your application's Go module:
+Install the package from your application's Go module:
 
 ```sh
-GOPRIVATE=github.com/teslashibe/imessage go get github.com/teslashibe/imessage
+go get github.com/teslashibe/imessage
 ```
 
-The repository is private; this command requires access and does not imply a public module release. Include this module alongside any existing `GOPRIVATE` patterns.
+## Compatibility and privacy
+
+| Area | Support and limitations |
+| --- | --- |
+| Go | The module declares Go 1.25.0. Use a patched Go toolchain; CI tests 1.25.13 and 1.26.6. |
+| imsg | RPC behavior is documented and tested against exactly imsg v0.15.1. Other versions may change methods, fields, or semantics. |
+| Reads, sends, and subscriptions | Supported through an operator-managed `imsg rpc` process. The caller owns process startup, authentication, transport security, and access policy. |
+| Native replies and tapbacks | In imsg v0.15.1 these require its private IMCore bridge. A normal signed imsg installation with SIP enabled does not provide them. There is no fallback in this package. |
+| macOS protections | This package does not install imsg, enable its private bridge, weaken SIP, alter entitlements, or change other system protections. |
+| Privacy | Messages, participants, chat metadata, and RPC payloads may be sensitive. Keep them out of logs and issue reports, secure the supplied streams, and grant the imsg host only the permissions it needs. |
 
 ## Usage
 
@@ -55,7 +65,7 @@ func CountChats(ctx context.Context, reader io.ReadCloser, writer io.WriteCloser
 
 ### Native reply and reaction limitations
 
-Source comments document these RPCs against imsg v0.15.1. Native inline replies and tapback RPCs require upstream's private IMCore bridge; a basic signed imsg installation with SIP enabled does not provide these capabilities. That bridge requires weakened macOS protections and can still encounter entitlement or library-validation restrictions. This package does not configure it or change system protections.
+Source comments document these RPCs against exactly imsg v0.15.1. Native inline replies and tapback RPCs require upstream's private IMCore bridge; a basic signed imsg installation with SIP enabled does not provide these capabilities. That bridge requires weakened macOS protections and can still encounter entitlement or library-validation restrictions. This package does not configure it or change system protections.
 
 There is no fallback to plain text, emoji messages, or the separate upstream CLI reaction command. See the [upstream capability documentation](https://github.com/openclaw/imsg/blob/v0.15.1/docs/advanced-imcore.md) before relying on these operations.
 
@@ -76,9 +86,11 @@ Notifications preserve unknown methods and raw parameters. Server `watch.overflo
 From the repository root:
 
 ```sh
+go mod tidy
 go build ./...
 go vet ./...
 go test ./...
+go test -race ./...
 ```
 
 Tests use in-memory streams and fake RPC peers, not live Messages. No executable is built or installed by this Go module. Keep message contents, participant identities, database paths, and raw RPC payloads out of public logs and examples.
