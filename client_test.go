@@ -131,7 +131,7 @@ func TestMethodsAndNotifications(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, line := range []string{
-		`{"jsonrpc":"2.0","method":"message","params":{"subscription":7,"message":{"id":81,"chat_id":42,"text":"new","is_group":true,"created_at":"2026-09-05T12:00:00Z"},"reason":{"extension":true}}}`,
+		`{"jsonrpc":"2.0","method":"message","params":{"subscription":7,"message":{"id":81,"chat_id":42,"text":"new","is_group":true,"created_at":"2026-09-05T12:00:00Z","attachments":[{"transfer_name":"brief.pdf","mime_type":"application/pdf","total_bytes":1234,"original_path":"/tmp/Messages/Attachments/brief.pdf"}]},"reason":{"extension":true}}}`,
 		`{"jsonrpc":"2.0","method":"watch.overflow","params":{"subscription":7,"resume_after_rowid":80,"reason":"buffer_limit_exceeded","terminal":true,"message":"watch status"}}`,
 		`{"jsonrpc":"2.0","method":"error","params":{"subscription":7,"error":{"message":"watch failed","code":-32603}}}`,
 	} {
@@ -140,7 +140,9 @@ func TestMethodsAndNotifications(t *testing.T) {
 		}
 	}
 	n := await(t, client.Notifications())
-	if n.Method != "message" || n.Subscription != 7 || n.Message == nil || n.Message.ID != 81 || !n.Message.IsGroup {
+	if n.Method != "message" || n.Subscription != 7 || n.Message == nil || n.Message.ID != 81 || !n.Message.IsGroup ||
+		len(n.Message.Attachments) != 1 || n.Message.Attachments[0].TransferName != "brief.pdf" ||
+		n.Message.Attachments[0].MIMEType != "application/pdf" || n.Message.Attachments[0].TotalBytes != 1234 {
 		t.Fatalf("unexpected notification: %+v", n)
 	}
 	n = await(t, client.Notifications())
