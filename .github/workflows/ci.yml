@@ -14,8 +14,8 @@ jobs:
       fail-fast: false
       matrix:
         go:
-          - 1.25.12
-          - 1.26.5
+          - "1.25.12"
+          - "1.26.5"
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
