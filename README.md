@@ -71,7 +71,7 @@ There is no fallback to plain text, emoji messages, or the separate upstream CLI
 
 ## Subscriptions and recovery
 
-`SubscribeAll(ctx, sinceRowID)` watches all chats; `SubscribeChat(ctx, chatID, sinceRowID)` watches one. Both return a subscription ID:
+`SubscribeAll(ctx, sinceRowID)` watches all chats; `SubscribeChat(ctx, chatID, sinceRowID)` watches one. The corresponding `SubscribeAllWithAttachments` and `SubscribeChatWithAttachments` variants request attachment metadata and resolved local paths from imsg. All return a subscription ID:
 
 - `0` starts at the current tail.
 - `-1` replays from the beginning.
@@ -80,6 +80,11 @@ There is no fallback to plain text, emoji messages, or the separate upstream CLI
 The context bounds subscription setup, not its lifetime. `Close` ends the client's subscriptions. Continuously consume `Notifications()` while subscribed and check `Err()` after the channel drains. Persist message IDs and deduplicate replayed events; row IDs belong to a particular Messages database and are not portable cursors.
 
 Notifications preserve unknown methods and raw parameters. Server `watch.overflow` events expose `ResumeAfterRowID`, `Reason`, and `Terminal` for application-managed recovery. Local notification buffering is bounded to 256 events: overflow terminates the client with `ErrNotificationOverflow`. JSON records are bounded to 8 MiB. Explicit closure records `ErrClosed`; `Close` itself returns nil.
+
+Attachment paths point into the Messages account's local attachment store and
+must be treated as untrusted metadata. Callers are responsible for authenticating
+the message, validating the resolved path and file type, bounding reads, and
+preventing symlink or path traversal before opening a file.
 
 ## Development
 
