@@ -1,0 +1,7 @@
+{
+  "upstream": "https://github.com/openclaw/imsg.git",
+  "revision": "f2455d94c72c05f105081f8c35319c87b496fc28",
+  "version": "0.15.3",
+  "patch_sha256": "82a416b9b46323004935474fe48b12d0c0922f78ebd8a865f15432f0cb7c103b",
+  "dependencies_sha256": "be55852d84140bb12cbf4c58bb67f8260337878837e80d6ddeef41f259a3ae00"
+}

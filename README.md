@@ -103,3 +103,9 @@ Tests use in-memory streams and fake RPC peers, not live Messages. No executable
 ## License
 
 [MIT](LICENSE). The external imsg runtime is distributed separately under its own license.
+
+## Optional native tapback backend
+
+For SIP-enabled standard reactions on the verified Mac setup, see the pinned
+[native backend build](native/README.md). The Go RPC API is unchanged. Unpatched
+upstream `imsg` still has its documented private-bridge requirements.
