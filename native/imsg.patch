@@ -1,0 +1,448 @@
+diff --git a/Sources/IMsgCore/NativeTapback.swift b/Sources/IMsgCore/NativeTapback.swift
+new file mode 100644
+index 0000000..3a5b964
+--- /dev/null
++++ b/Sources/IMsgCore/NativeTapback.swift
+@@ -0,0 +1,255 @@
++import Foundation
++import SQLite
++
++// SIP-enabled standard tapbacks. The exact-message link and custom action names
++// follow Beeper platform-imessage v0.24.2 (MIT); see the downstream build notes.
++public struct NativeTapback {
++  let store: MessageStore
++  var dispatch: (String, String, String) throws -> Void = Self.dispatchOnce
++  var verificationTimeout: TimeInterval = 8
++
++  public init(store: MessageStore) { self.store = store }
++
++  public func set(chatGUID: String, messageGUID: String, reactionType: Int, partIndex: Int) throws {
++    let removing = (3000...3005).contains(reactionType)
++    let addition = removing ? reactionType - 1000 : reactionType
++    guard partIndex == 0, (2000...2005).contains(addition), UUID(uuidString: messageGUID) != nil
++    else {
++      throw Self.failure(
++        .notStarted, "Native tapbacks require an exact UUID, part zero and a standard reaction.")
++    }
++    let initial = try store.nativeTapbackSnapshot(chatGUID: chatGUID, messageGUID: messageGUID)
++    if Self.satisfied(current: initial.reaction, desired: addition, removing: removing) { return }
++    let titles = [
++      "Heart", "Thumbs up", "Thumbs down", "Ha ha!", "Exclamation mark", "Question mark",
++    ]
++    try dispatch(messageGUID, initial.text, titles[addition - 2000])
++    // Dispatch has happened. Every subsequent failure must preserve uncertainty.
++    do {
++      let deadline = ContinuousClock.now + .seconds(verificationTimeout)
++      repeat {
++        let current = try store.nativeTapbackSnapshot(chatGUID: chatGUID, messageGUID: messageGUID)
++        guard current.rowID == initial.rowID, current.text == initial.text else {
++          throw Self.failure(.mayHaveCompleted, "Target changed while verifying the reaction.")
++        }
++        if Self.satisfied(current: current.reaction, desired: addition, removing: removing) {
++          return
++        }
++        Thread.sleep(forTimeInterval: 0.15)
++      } while ContinuousClock.now < deadline
++    } catch {
++      throw Self.failure(
++        .mayHaveCompleted, "Cannot verify the exact target reaction after dispatch.")
++    }
++    throw Self.failure(
++      .mayHaveCompleted, "Reaction was dispatched but its requested state was not observed.")
++  }
++
++  static func satisfied(current: Int?, desired: Int, removing: Bool) -> Bool {
++    removing ? current != desired : current == desired
++  }
++
++  static func failure(_ disposition: DeliveryDisposition, _ detail: String) -> DeliveryFailure {
++    DeliveryFailure(
++      disposition: disposition, transport: .appleScript, operation: "send-reaction", detail: detail)
++  }
++
++  static func dispatchOnce(_ guid: String, _ text: String, _ title: String) throws {
++    let process = Process()
++    process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
++    process.arguments = [
++      "-e", script, "imessage:open?message-guid=" + guid + "&overlay=1", text, title,
++    ]
++    let output = Pipe()
++    process.standardOutput = output
++    process.standardError = FileHandle.nullDevice
++    do { try process.run() } catch {
++      throw failure(.notStarted, "Could not start the native reaction operation.")
++    }
++    if ProcessTimeout.waitUntilExit(process, timeout: 20) {
++      throw failure(.stillInFlight, "Native reaction timed out; do not retry the operation.")
++    }
++    let result = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
++      .trimmingCharacters(in: .whitespacesAndNewlines)
++    guard process.terminationStatus == 0, result == "dispatched" else {
++      throw failure(
++        result == "not_started" ? .notStarted : .mayHaveCompleted,
++        "Native reaction did not return a verified dispatch result.")
++    }
++  }
++
++  // Inputs are argv data, never script source. This script performs one action
++  // at most. No effect retry, keyboard shortcut, latest-message or chat search.
++  static let script = #"""
++    on exactBody(e, expectedText)
++      tell application "System Events"
++        try
++          set contentsList to entire contents of e
++          set matches to 0
++          repeat with i from 1 to count contentsList
++            set childElement to item i of contentsList
++            try
++              if (role of childElement as text) is "AXTextArea" then
++                if (value of childElement as text) is expectedText then set matches to matches + 1
++              end if
++            end try
++          end repeat
++          return matches is 1
++        on error
++          return false
++        end try
++      end tell
++    end exactBody
++
++    on run argv
++      set dispatched to false
++      try
++        set targetURL to item 1 of argv
++        set expectedText to item 2 of argv
++        set actionPrefix to "Name:" & item 3 of argv & linefeed
++        tell application "System Events"
++          tell process "Messages"
++            -- Close any stale reply overlay before opening the exact new target.
++            set es to entire contents of front window
++            repeat with i from 1 to count es
++              set e to item i of es
++              try
++                if (description of e as text) is "Reply transcript" then
++                  set cells to entire contents of e
++                  repeat with j from 1 to count cells
++                    set cell to item j of cells
++                    if (name of every action of cell) contains "AXCancel" then
++                      perform action "AXCancel" of cell
++                      exit repeat
++                    end if
++                  end repeat
++                  exit repeat
++                end if
++              end try
++            end repeat
++          end tell
++        end tell
++        delay 0.2
++        tell application "System Events"
++          tell process "Messages"
++            set es to entire contents of front window
++            repeat with i from 1 to count es
++              set e to item i of es
++              try
++                if (description of e as text) is "Reply transcript" then return "not_started"
++              end try
++            end repeat
++          end tell
++        end tell
++        open location targetURL
++        repeat 30 times
++          delay 0.1
++          tell application "System Events"
++            tell process "Messages"
++              set es to entire contents of front window
++              set candidates to {}
++              set candidateActions to {}
++              repeat with i from 1 to count es
++                set e to item i of es
++                try
++                  if (description of e as text) is "Reply transcript" then
++                    set cells to entire contents of e
++                    repeat with j from 1 to count cells
++                      set cell to item j of cells
++                      try
++                        if (description of cell as text) contains expectedText then
++                          set acts to name of every action of cell
++                          repeat with k from 1 to count acts
++                            set a to item k of acts
++                            if a starts with actionPrefix and my exactBody(cell, expectedText) then
++                              set end of candidates to cell
++                              set end of candidateActions to a
++                            end if
++                          end repeat
++                        end if
++                      end try
++                    end repeat
++                  end if
++                end try
++              end repeat
++              if (count candidates) is 1 then
++                set targetElement to item 1 of candidates
++                set targetAction to item 1 of candidateActions
++                if not (my exactBody(targetElement, expectedText)) then return "not_started"
++                set dispatched to true
++                perform action targetAction of targetElement
++                return "dispatched"
++              end if
++              if (count candidates) > 1 then return "not_started"
++            end tell
++          end tell
++        end repeat
++        return "not_started"
++      on error
++        if dispatched then return "unknown"
++        return "not_started"
++      end try
++    end run
++    """#
++}
++
++struct NativeTapbackSnapshot: Equatable {
++  let rowID: Int64
++  let text: String
++  let reaction: Int?
++}
++
++extension MessageStore {
++  func nativeTapbackSnapshot(chatGUID: String, messageGUID: String) throws -> NativeTapbackSnapshot
++  {
++    guard schema.hasReactionColumns else {
++      throw NativeTapback.failure(.notStarted, "Messages reaction metadata is unavailable.")
++    }
++    return try withConnection { db in
++      let rows = try db.prepareRowIterator(
++        """
++        SELECT m.ROWID AS rowid, IFNULL(m.text, '') AS text
++        FROM message m JOIN chat_message_join j ON j.message_id=m.ROWID
++        JOIN chat c ON c.ROWID=j.chat_id
++        WHERE m.guid=? AND c.guid=? AND c.service_name='iMessage'
++          AND IFNULL(m.associated_message_type,0)=0
++          AND NOT EXISTS (SELECT 1 FROM message_attachment_join a WHERE a.message_id=m.ROWID)
++        """, bindings: [messageGUID, chatGUID])
++      guard let row = try rows.failableNext(), try rows.failableNext() == nil else {
++        throw NativeTapback.failure(
++          .notStarted, "Exact message and chat could not be resolved uniquely.")
++      }
++      let rowID = try int64Value(row, "rowid") ?? 0
++      let text = try stringValue(row, "text")
++      guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, text.utf8.count <= 65536
++      else {
++        throw NativeTapback.failure(
++          .notStarted, "Native tapbacks require a bounded plain-text message.")
++      }
++      // AX has no GUID attribute. A duplicate body could make a stale/wrong
++      // overlay indistinguishable; refuse it rather than guessing a bubble.
++      let duplicates = try db.prepareRowIterator(
++        "SELECT COUNT(*) AS count FROM message WHERE text=?", bindings: [text])
++      guard let count = try duplicates.failableNext(), try int64Value(count, "count") == 1 else {
++        throw NativeTapback.failure(
++          .notStarted, "Message text is ambiguous in the Messages database.")
++      }
++      let events = try db.prepareRowIterator(
++        """
++        SELECT r.associated_message_type AS type
++        FROM message r JOIN chat_message_join j ON j.message_id=r.ROWID
++        JOIN chat c ON c.ROWID=j.chat_id
++        WHERE c.guid=? AND r.is_from_me=1
++          AND r.associated_message_guid IN (?, ?)
++          AND (r.associated_message_type BETWEEN 2000 AND 2006 OR r.associated_message_type BETWEEN 3000 AND 3006)
++        ORDER BY r.date, r.ROWID
++        """, bindings: [chatGUID, messageGUID, "p:0/" + messageGUID])
++      var current: Int?
++      while let event = try events.failableNext() {
++        let type = try intValue(event, "type") ?? 0
++        if type < 3000 { current = type } else if current == type - 1000 { current = nil }
++      }
++      return NativeTapbackSnapshot(rowID: rowID, text: text, reaction: current)
++    }
++  }
++}
+diff --git a/Sources/imsg/RPCServer+BridgeMessageHandlers.swift b/Sources/imsg/RPCServer+BridgeMessageHandlers.swift
+index 711d5b0..997c47e 100644
+--- a/Sources/imsg/RPCServer+BridgeMessageHandlers.swift
++++ b/Sources/imsg/RPCServer+BridgeMessageHandlers.swift
+@@ -467,6 +467,19 @@ extension RPCServer {
+       rawReaction,
+       remove: remove
+     )
++    if !isBridgeReady() {
++      let database = try await databaseResources.require()
++      guard let kind = BridgeReactionKind(rawValue: reactionType) else {
++        throw RPCError.invalidParams("unsupported native reaction")
++      }
++      try await Task.detached {
++        try NativeTapback(store: database.store).set(
++          chatGUID: chatGUID, messageGUID: messageGUID,
++          reactionType: kind.associatedMessageType, partIndex: partIndex)
++      }.value
++      respond(id: id, result: ["ok": true, "reaction": reactionType, "verified": true])
++      return
++    }
+     _ = try await invokeBridge(
+       action: .sendReaction,
+       params: [
+diff --git a/Tests/IMsgCoreTests/NativeTapbackTests.swift b/Tests/IMsgCoreTests/NativeTapbackTests.swift
+new file mode 100644
+index 0000000..d0596d3
+--- /dev/null
++++ b/Tests/IMsgCoreTests/NativeTapbackTests.swift
+@@ -0,0 +1,157 @@
++import Foundation
++import SQLite
++import Testing
++
++@testable import IMsgCore
++
++private let nativeGUID = "B0BC6779-927C-4C91-8D05-835EBDB67C68"
++private let nativeChat = "iMessage;+;native-fixture"
++
++private func nativeFixture() throws -> (MessageStore, Connection) {
++  let db = try Connection(.inMemory)
++  var options = MessageDatabaseFixture.SchemaOptions()
++  options.includeReactionColumns = true
++  try MessageDatabaseFixture.createSchema(db, options: options)
++  try db.run("INSERT INTO chat(ROWID,guid,service_name) VALUES(1,?,'iMessage')", nativeChat)
++  try db.run(
++    "INSERT INTO message(ROWID,guid,text,date,is_from_me) VALUES(1,?,'unique fixture',1,0)",
++    nativeGUID)
++  try db.run("INSERT INTO chat_message_join(chat_id,message_id) VALUES(1,1)")
++  return (try MessageStore(connection: db, path: ":memory:"), db)
++}
++
++private func event(_ db: Connection, _ row: Int64, _ type: Int) throws {
++  try db.run(
++    "INSERT INTO message(ROWID,associated_message_guid,associated_message_type,date,is_from_me) VALUES(?,?,?,?,1)",
++    row, "p:0/" + nativeGUID, type, row)
++  try db.run("INSERT INTO chat_message_join(chat_id,message_id) VALUES(1,?)", row)
++}
++
++@Test
++func nativeTapbackRefusesWrongChatAndDuplicateTextBeforeDispatch() throws {
++  let (store, db) = try nativeFixture()
++  var calls = 0
++  var client = NativeTapback(store: store)
++  client.dispatch = { _, _, _ in calls += 1 }
++  #expect(throws: DeliveryFailure.self) {
++    try client.set(
++      chatGUID: "iMessage;+;wrong", messageGUID: nativeGUID, reactionType: 2001, partIndex: 0)
++  }
++  try db.run("INSERT INTO message(ROWID,text) VALUES(2,'unique fixture')")
++  #expect(throws: DeliveryFailure.self) {
++    try client.set(chatGUID: nativeChat, messageGUID: nativeGUID, reactionType: 2001, partIndex: 0)
++  }
++  #expect(calls == 0)
++}
++
++@Test
++func nativeTapbackRejectsAttachmentAndUnsupportedPartBeforeDispatch() throws {
++  let (store, db) = try nativeFixture()
++  var client = NativeTapback(store: store)
++  client.dispatch = { _, _, _ in Issue.record("unexpected dispatch") }
++  #expect(throws: DeliveryFailure.self) {
++    try client.set(chatGUID: nativeChat, messageGUID: nativeGUID, reactionType: 2001, partIndex: 1)
++  }
++  try db.run("INSERT INTO message_attachment_join(message_id,attachment_id) VALUES(1,9)")
++  #expect(throws: DeliveryFailure.self) {
++    try client.set(chatGUID: nativeChat, messageGUID: nativeGUID, reactionType: 2001, partIndex: 0)
++  }
++}
++
++@Test
++func nativeTapbackReducesReplacementAndMatchingRemoval() throws {
++  let (store, db) = try nativeFixture()
++  try event(db, 2, 2001)
++  try event(db, 3, 2004)
++  try event(db, 4, 3001)
++  #expect(
++    try store.nativeTapbackSnapshot(chatGUID: nativeChat, messageGUID: nativeGUID).reaction == 2004)
++  try event(db, 5, 3004)
++  #expect(
++    try store.nativeTapbackSnapshot(chatGUID: nativeChat, messageGUID: nativeGUID).reaction == nil)
++}
++
++@Test
++func nativeTapbackAlreadySatisfiedDoesNotToggle() throws {
++  let (store, db) = try nativeFixture()
++  try event(db, 2, 2001)
++  var calls = 0
++  var client = NativeTapback(store: store)
++  client.dispatch = { _, _, _ in calls += 1 }
++  try client.set(chatGUID: nativeChat, messageGUID: nativeGUID, reactionType: 2001, partIndex: 0)
++  try client.set(chatGUID: nativeChat, messageGUID: nativeGUID, reactionType: 3004, partIndex: 0)
++  #expect(calls == 0)
++}
++
++@Test(arguments: [false, true])
++func nativeTapbackDispatchesOnceAndVerifies(removing: Bool) throws {
++  let (store, db) = try nativeFixture()
++  if removing { try event(db, 2, 2001) }
++  var calls = 0
++  var client = NativeTapback(store: store)
++  let type = removing ? 3001 : 2001
++  client.dispatch = { guid, text, title in
++    calls += 1
++    #expect(guid == nativeGUID)
++    #expect(text == "unique fixture")
++    #expect(title == "Thumbs up")
++    try event(db, 3, type)
++  }
++  try client.set(chatGUID: nativeChat, messageGUID: nativeGUID, reactionType: type, partIndex: 0)
++  #expect(calls == 1)
++}
++
++@Test(arguments: [false, true])
++func nativeTapbackNeverRetriesAnUnverifiedDispatch(changed: Bool) throws {
++  let (store, db) = try nativeFixture()
++  var calls = 0
++  var client = NativeTapback(store: store)
++  client.verificationTimeout = 0
++  client.dispatch = { _, _, _ in
++    calls += 1
++    if changed { try db.run("UPDATE message SET text='edited fixture' WHERE ROWID=1") }
++  }
++  do {
++    try client.set(chatGUID: nativeChat, messageGUID: nativeGUID, reactionType: 2001, partIndex: 0)
++    Issue.record("unverified effect returned success")
++  } catch let failure as DeliveryFailure {
++    #expect(failure.disposition == .mayHaveCompleted)
++    #expect(!failure.retrySafe)
++  }
++  #expect(calls == 1)
++}
++
++@Test
++func nativeTapbackPreservesDispatcherUncertainty() throws {
++  let (store, _) = try nativeFixture()
++  var client = NativeTapback(store: store)
++  var calls = 0
++  client.dispatch = { _, _, _ in
++    calls += 1
++    throw NativeTapback.failure(.stillInFlight, "fixture uncertainty")
++  }
++  do {
++    try client.set(chatGUID: nativeChat, messageGUID: nativeGUID, reactionType: 2001, partIndex: 0)
++    Issue.record("uncertain effect returned success")
++  } catch let failure as DeliveryFailure {
++    #expect(failure.disposition == .stillInFlight)
++  }
++  #expect(calls == 1)
++}
++
++@Test
++func nativeTapbackScriptCompilesWithoutExecuting() throws {
++  let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
++  try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
++  defer { try? FileManager.default.removeItem(at: dir) }
++  let source = dir.appendingPathComponent("fixture.applescript")
++  try NativeTapback.script.write(to: source, atomically: true, encoding: .utf8)
++  let process = Process()
++  process.executableURL = URL(fileURLWithPath: "/usr/bin/osacompile")
++  process.arguments = ["-o", dir.appendingPathComponent("fixture.scpt").path, source.path]
++  process.standardOutput = FileHandle.nullDevice
++  process.standardError = FileHandle.nullDevice
++  try process.run()
++  #expect(!ProcessTimeout.waitUntilExit(process, timeout: 10))
++  #expect(process.terminationStatus == 0)
++}

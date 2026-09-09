@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""Build and test the pinned native imsg backend; signing/install are separate."""
+import argparse
+import hashlib
+import json
+import platform
+from pathlib import Path
+import shutil
+import subprocess
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, required=True, help="new output directory")
+    args = parser.parse_args()
+    if platform.system() != "Darwin":
+        parser.error("build on the macOS host used for verification")
+    root = Path(__file__).resolve().parent.parent
+    native = root / "native"
+    manifest = json.loads((native / "manifest.json").read_text())
+    if digest(native / "imsg.patch") != manifest["patch_sha256"] or digest(native / "Package.resolved") != manifest["dependencies_sha256"]:
+        raise SystemExit("native source manifest mismatch")
+    output = args.output.expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    source = output / "source"
+    source.mkdir()
+    summary = {"manifest": manifest, "checks": [], "status": "running", "native_effects": "not run", "signing": "not performed"}
+
+    def run(name, command):
+        with (output / (name + ".log")).open("w") as log:
+            result = subprocess.run(command, cwd=source, stdout=log, stderr=subprocess.STDOUT)
+        summary["checks"].append({"name": name, "exit_code": result.returncode})
+        (output / "summary.json").write_text(json.dumps(summary, indent=2))
+        print(name, "PASS" if result.returncode == 0 else "FAIL", flush=True)
+        if result.returncode:
+            raise RuntimeError(name + " failed; inspect the retained log")
+
+    try:
+        run("init", ["git", "init"])
+        run("fetch", ["git", "fetch", "--depth=1", manifest["upstream"], manifest["revision"]])
+        run("checkout", ["git", "checkout", "--detach", manifest["revision"]])
+        run("patch-check", ["git", "apply", "--check", str(native / "imsg.patch")])
+        run("patch", ["git", "apply", str(native / "imsg.patch")])
+        shutil.copy2(native / "Package.resolved", source / "Package.resolved")
+        run("version", ["scripts/generate-version.sh"])
+        run("dependencies", ["swift", "package", "resolve"])
+        if digest(source / "Package.resolved") != manifest["dependencies_sha256"]:
+            raise RuntimeError("dependency resolution changed the pinned versions")
+        run("upstream-resource-fixes", ["scripts/patch-deps.sh"])
+        run("format", ["swift", "format", "lint", "--strict", "Sources/IMsgCore/NativeTapback.swift", "Sources/imsg/RPCServer+BridgeMessageHandlers.swift", "Tests/IMsgCoreTests/NativeTapbackTests.swift"])
+        run("test", ["swift", "test", "--force-resolved-versions"])
+        run("build", ["swift", "build", "-c", "release", "--product", "imsg", "--force-resolved-versions"])
+        artifacts = output / "bin"
+        artifacts.mkdir()
+        shutil.copy2(source / ".build/release/imsg", artifacts / "imsg")
+        for bundle in (source / ".build/release").glob("*.bundle"):
+            shutil.copytree(bundle, artifacts / bundle.name)
+        summary["artifact_sha256"] = digest(artifacts / "imsg")
+        summary["status"] = "passed"
+    except Exception:
+        summary["status"] = "failed"
+        raise
+    finally:
+        (output / "summary.json").write_text(json.dumps(summary, indent=2))
+
+
+if __name__ == "__main__":
+    main()
