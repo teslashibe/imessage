@@ -109,3 +109,14 @@ Tests use in-memory streams and fake RPC peers, not live Messages. No executable
 For SIP-enabled standard reactions on the verified Mac setup, see the pinned
 [native backend build](native/README.md). The Go RPC API is unchanged. Unpatched
 upstream `imsg` still has its documented private-bridge requirements.
+
+### Tapback receipts
+
+`ReactWithResult` and `RemoveReactionWithResult` preserve the native backend's
+optional `Verified` result. `OK` alone is request acceptance; `Verified` means
+the requested state was observed in the sender's Messages database. Neither
+proves another device received it. The existing error-only methods remain
+compatible. `RPCError.NotStarted()` recognizes explicit, consistent pre-dispatch
+evidence; other failures remain uncertain. These APIs never retry automatically.
+Audio and other attachments remain unsupported by the conservative native
+backend until exact UI target identity can be verified; see [native limits](native/README.md).

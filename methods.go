@@ -96,41 +96,41 @@ func (c *Client) send(ctx context.Context, chatID int64, text, replyTo string) (
 	return result, nil
 }
 
-// React adds a native tapback to messageGUID in the given chat. imsg v0.15.1's
-// tapback RPC requires both targets; it cannot infer a chat from a message GUID.
-// Reactions target the first message part (upstream's default).
-//
-// Like Reply, this requires the private IMCore bridge, including its sendReaction
-// capability. A basic signed install with SIP enabled cannot use this RPC. The
-// separate CLI react command uses AppleScript/accessibility automation and only
-// targets the latest incoming message; it is not an RPC fallback. This stream
-// client starts no processes and never substitutes emoji text for a tapback.
-//
-// Success acknowledges acceptance, not delivery. Upstream RPCError details are
-// preserved; cancellation or transport failure can leave the outcome uncertain.
-// No operation is retried automatically.
-//
-// See https://github.com/openclaw/imsg/blob/v0.15.1/Sources/imsg/RPCServer+BridgeMessageHandlers.swift
-// and https://github.com/openclaw/imsg/blob/v0.15.1/Sources/imsg/Commands/ReactCommand.swift.
+// React adds a native tapback to the exact chat/message target. It preserves
+// RPC errors and does not retry. Use ReactWithResult to inspect native verification.
 func (c *Client) React(ctx context.Context, chatID int64, messageGUID string, reaction Reaction) error {
+	_, err := c.ReactWithResult(ctx, chatID, messageGUID, reaction)
+	return err
+}
+
+// ReactWithResult returns upstream acceptance and optional sender-side native
+// verification. Unpatched upstream imsg requires its injected IMCore bridge;
+// the optional downstream native backend supports bounded, unique plain text.
+// Neither backend proves delivery to another participant's device.
+func (c *Client) ReactWithResult(ctx context.Context, chatID int64, messageGUID string, reaction Reaction) (TapbackResult, error) {
 	return c.tapback(ctx, chatID, messageGUID, reaction, false)
 }
 
-// RemoveReaction removes the specified native tapback from messageGUID in the
-// given chat. It has the same capability, acknowledgement, and retry constraints
-// as React; it does not delete the target message or send any text.
+// RemoveReaction removes the specified native tapback without deleting its
+// target or sending text. It shares React's exact-target and retry constraints.
 func (c *Client) RemoveReaction(ctx context.Context, chatID int64, messageGUID string, reaction Reaction) error {
+	_, err := c.RemoveReactionWithResult(ctx, chatID, messageGUID, reaction)
+	return err
+}
+
+// RemoveReactionWithResult preserves the optional native removal verification.
+func (c *Client) RemoveReactionWithResult(ctx context.Context, chatID int64, messageGUID string, reaction Reaction) (TapbackResult, error) {
 	return c.tapback(ctx, chatID, messageGUID, reaction, true)
 }
 
-func (c *Client) tapback(ctx context.Context, chatID int64, messageGUID string, reaction Reaction, remove bool) error {
+func (c *Client) tapback(ctx context.Context, chatID int64, messageGUID string, reaction Reaction, remove bool) (TapbackResult, error) {
 	if chatID <= 0 || strings.TrimSpace(messageGUID) == "" {
-		return fmt.Errorf("imessage: chat ID must be positive and message GUID non-empty")
+		return TapbackResult{}, fmt.Errorf("imessage: chat ID must be positive and message GUID non-empty")
 	}
 	switch reaction {
 	case ReactionLove, ReactionLike, ReactionDislike, ReactionLaugh, ReactionEmphasize, ReactionQuestion:
 	default:
-		return fmt.Errorf("imessage: unsupported reaction %q", reaction)
+		return TapbackResult{}, fmt.Errorf("imessage: unsupported reaction %q", reaction)
 	}
 	params := struct {
 		ChatID      int64    `json:"chat_id"`
@@ -138,19 +138,16 @@ func (c *Client) tapback(ctx context.Context, chatID int64, messageGUID string, 
 		Reaction    Reaction `json:"reaction"`
 		Remove      bool     `json:"remove"`
 	}{chatID, messageGUID, reaction, remove}
-	var result struct {
-		OK       bool   `json:"ok"`
-		Reaction string `json:"reaction"`
-	}
+	var result TapbackResult
 	if err := c.call(ctx, "tapback", params, &result); err != nil {
-		return err
+		return TapbackResult{}, err
 	}
 	expected := string(reaction)
 	if remove {
 		expected = "remove-" + expected
 	}
 	if !result.OK || result.Reaction != expected {
-		return fmt.Errorf("%w: tapback did not acknowledge %s", ErrProtocol, expected)
+		return TapbackResult{}, fmt.Errorf("%w: tapback did not acknowledge %s", ErrProtocol, expected)
 	}
-	return nil
+	return result, nil
 }
