@@ -85,6 +85,14 @@ type SendResult struct {
 	Transport string `json:"transport,omitempty"`
 }
 
+// TapbackResult distinguishes RPC acceptance from optional verification in the
+// sender's Messages database. Verified never proves recipient-device delivery.
+type TapbackResult struct {
+	OK       bool   `json:"ok"`
+	Reaction string `json:"reaction"`
+	Verified bool   `json:"verified,omitempty"`
+}
+
 // RPCError preserves data verbatim, including retry_safe and disposition for
 // ambiguous sends. The client never retries a request automatically.
 type RPCError struct {
@@ -95,6 +103,20 @@ type RPCError struct {
 
 func (e *RPCError) Error() string {
 	return fmt.Sprintf("imessage RPC error %d: %s", e.Code, e.Message)
+}
+
+// NotStarted reports explicit upstream evidence that dispatch did not start.
+// It is classification, not permission to retry. Missing, malformed or
+// contradictory data remains uncertain; Data itself is preserved unchanged.
+func (e *RPCError) NotStarted() bool {
+	if e == nil {
+		return false
+	}
+	var data struct {
+		Disposition string `json:"disposition"`
+		RetrySafe   bool   `json:"retry_safe"`
+	}
+	return json.Unmarshal(e.Data, &data) == nil && data.Disposition == "not_started" && data.RetrySafe
 }
 
 // Notification preserves every upstream method and its unmodified parameters.

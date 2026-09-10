@@ -198,3 +198,65 @@ func TestNativeMutationErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestTapbackResultPreservesVerifiedEvidence(t *testing.T) {
+	for _, remove := range []bool{false, true} {
+		for _, verified := range []bool{false, true} {
+			client, server := newTestClient(t)
+			type answer struct {
+				result TapbackResult
+				err    error
+			}
+			done := make(chan answer, 1)
+			go func() {
+				var result TapbackResult
+				var err error
+				if remove {
+					result, err = client.RemoveReactionWithResult(testContext(t), 42, "exact-guid", ReactionLove)
+				} else {
+					result, err = client.ReactWithResult(testContext(t), 42, "exact-guid", ReactionLove)
+				}
+				done <- answer{result, err}
+			}()
+			request := server.request(t, "tapback")
+			reaction := "love"
+			if remove {
+				reaction = "remove-love"
+			}
+			ack := map[string]any{"ok": true, "reaction": reaction}
+			if verified {
+				ack["verified"] = true
+			}
+			server.reply(t, request.ID, ack)
+			got := await(t, done)
+			if got.err != nil || !got.result.OK || got.result.Reaction != reaction || got.result.Verified != verified {
+				t.Fatalf("result=%+v err=%v", got.result, got.err)
+			}
+		}
+	}
+}
+
+func TestRPCNotStartedRequiresConsistentEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		data string
+		want bool
+	}{
+		{`{"disposition":"not_started","retry_safe":true}`, true},
+		{`{"disposition":"not_started","retry_safe":false}`, false},
+		{`{"disposition":"not_started"}`, false},
+		{`{"disposition":"may_have_completed","retry_safe":true}`, false},
+		{`{"disposition":"still_in_flight","retry_safe":false}`, false},
+		{`{"disposition":"future","retry_safe":true}`, false},
+		{`{"disposition":"not_started","retry_safe":"true"}`, false},
+		{`null`, false}, {`"denied"`, false}, {`{`, false},
+	} {
+		e := &RPCError{Data: json.RawMessage(tc.data)}
+		if e.NotStarted() != tc.want || string(e.Data) != tc.data {
+			t.Fatalf("classification changed evidence: %s", tc.data)
+		}
+	}
+	var e *RPCError
+	if e.NotStarted() {
+		t.Fatal("nil error cannot prove no dispatch")
+	}
+}
